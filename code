@@ -1,0 +1,1011 @@
+import os
+import socket
+import streamlit as st
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.memory import ConversationBufferMemory
+from langchain_groq import ChatGroq
+import hashlib
+import json
+from pathlib import Path
+from datetime import datetime
+import uuid
+import requests
+import time
+
+# === Configuration ===
+USER_DATA_FILE = "user_data.json"
+PERSIST_DIR = "chroma_db"
+PDF_FOLDER = r"C:\Users\MSI\Downloads\Mental Health Chatbot"  # Update this path
+GROQ_API_KEY = "API_KEY"  # Replace with your key
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+
+# === Network Utilities ===
+def check_internet():
+    """Check if there's an active internet connection."""
+    try:
+        socket.create_connection(("www.google.com", 80), timeout=5)
+        return True
+    except OSError:
+        return False
+
+def check_huggingface():
+    """Check if HuggingFace is reachable."""
+    try:
+        response = requests.get("https://huggingface.co", timeout=10)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+def ensure_network():
+    """Ensure network and required services are available."""
+    if not check_internet():
+        st.error("❌ No internet connection detected. Please check your network and try again.")
+        st.stop()
+    
+    if not check_huggingface():
+        st.error("❌ Could not connect to HuggingFace services. Please try again later.")
+        st.stop()
+
+# === Initial Checks ===
+ensure_network()
+
+# Set page config FIRST (before any other Streamlit commands)
+st.set_page_config(
+    page_title="ARI",
+    page_icon="🧠",
+    layout="wide"
+)
+
+# === User Authentication Functions ===
+def load_user_data():
+    """Load user data from JSON file."""
+    if not Path(USER_DATA_FILE).exists():
+        return {}
+    try:
+        with open(USER_DATA_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading user data: {str(e)}")
+        return {}
+
+def save_user_data(data):
+    """Save user data to JSON file."""
+    try:
+        with open(USER_DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        st.error(f"Error saving user data: {str(e)}")
+
+def hash_password(password):
+    """Hash password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password, age=None, gender=None):
+    """Register a new user with additional demographic information."""
+    user_data = load_user_data()
+    if username in user_data:
+        return False, "Username already exists"
+    
+    user_data[username] = {
+        "password_hash": hash_password(password),
+        "age": age,
+        "gender": gender,
+        "chat_sessions": {},
+        "current_session": None
+    }
+    save_user_data(user_data)
+    return True, "Registration successful"
+
+def authenticate_user(username, password):
+    """Authenticate an existing user."""
+    user_data = load_user_data()
+    if username not in user_data:
+        return False, "Username not found"
+    
+    if user_data[username]["password_hash"] != hash_password(password):
+        return False, "Incorrect password"
+    
+    return True, "Login successful"
+
+def create_new_session(username):
+    """Create a new chat session for the user."""
+    user_data = load_user_data()
+    session_id = str(uuid.uuid4())
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    if username not in user_data:
+        return None
+    
+    if not user_data[username].get("chat_sessions"):
+        user_data[username]["chat_sessions"] = {}
+    
+    user_data[username]["chat_sessions"][session_id] = {
+        "created_at": timestamp,
+        "history": []
+    }
+    user_data[username]["current_session"] = session_id
+    save_user_data(user_data)
+    return session_id
+
+def get_user_sessions(username):
+    """Get all chat sessions for a user."""
+    user_data = load_user_data()
+    if username not in user_data:
+        return {}
+    return user_data[username].get("chat_sessions", {})
+
+def load_session_history(username, session_id):
+    """Load chat history for a specific session."""
+    user_data = load_user_data()
+    if username not in user_data:
+        return []
+    return user_data[username]["chat_sessions"].get(session_id, {}).get("history", [])
+
+def save_current_session(username):
+    """Save the current session chat history."""
+    if "chat_history" not in st.session_state:
+        return
+    
+    user_data = load_user_data()
+    if username not in user_data:
+        return
+    
+    current_session = user_data[username].get("current_session")
+    if not current_session:
+        return
+    
+    user_data[username]["chat_sessions"][current_session]["history"] = st.session_state.chat_history
+    save_user_data(user_data)
+
+def delete_session(username, session_id):
+    """Delete a specific session for a user."""
+    user_data = load_user_data()
+    if username not in user_data:
+        return False
+    
+    if session_id not in user_data[username]["chat_sessions"]:
+        return False
+    
+    if user_data[username].get("current_session") == session_id:
+        user_data[username]["current_session"] = None
+    
+    del user_data[username]["chat_sessions"][session_id]
+    save_user_data(user_data)
+    return True
+
+def delete_session_and_refresh(username, session_id):
+    """Delete a session and refresh the UI."""
+    if delete_session(username, session_id):
+        st.rerun()
+
+# === Initialize LLM ===
+@st.cache_resource(show_spinner=False)
+def initialize_llm():
+    if not GROQ_API_KEY:
+        st.error("Please set the GROQ_API_KEY environment variable")
+        st.stop()
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            return ChatGroq(
+                temperature=0.7,  # Increased for more varied responses
+                groq_api_key=GROQ_API_KEY,
+                model_name="llama-3.3-70b-versatile",
+                verbose=True
+            )
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                st.error(f"Failed to initialize LLM after {MAX_RETRIES} attempts: {str(e)}")
+                st.stop()
+            time.sleep(RETRY_DELAY)
+
+# === Create or load Vector DB ===
+@st.cache_resource(show_spinner=True)
+def create_vector_db():
+    try:
+        if not os.path.exists(PDF_FOLDER):
+            st.error(f"PDF folder not found: {PDF_FOLDER}")
+            st.stop()
+            
+        loader = DirectoryLoader(PDF_FOLDER, glob="*.pdf", loader_cls=PyPDFLoader)
+        documents = loader.load()
+        
+        if not documents:
+            st.error("No PDFs loaded! Check your folder path.")
+            st.stop()
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        texts = text_splitter.split_documents(documents)
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                embeddings = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/all-mpnet-base-v2",
+                    model_kwargs={'device': 'cpu'}
+                )
+                vector_db = Chroma.from_documents(texts, embeddings, persist_directory=PERSIST_DIR)
+                st.success(f"Loaded {len(texts)} document chunks!")
+                return vector_db
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    st.error(f"Failed to create vector database after {MAX_RETRIES} attempts: {str(e)}")
+                    st.stop()
+                time.sleep(RETRY_DELAY)
+                
+    except Exception as e:
+        st.error(f"Failed to initialize document processing: {str(e)}")
+        st.stop()
+
+# === Setup the conversational chain ===
+def setup_conversational_chain(vector_db, llm):
+    retriever = vector_db.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 3,  # Reduced number of documents to retrieve
+            "score_threshold": 0.75,  # Higher threshold for more relevant docs
+            "fetch_k": 10  # Reduced fetch size
+        }
+    )
+    
+
+    # Main prompt template
+    main_prompt_template ="""
+You are ARI, a compassionate and non-judgmental mental health support assistant.
+
+Your role is to gently support the user through conversation, offering empathy, space to reflect, and — when asked or after enough context — clear and helpful advice.
+
+You speak naturally, one step at a time, just like a human in a caring conversation.
+
+Behavior Guidelines for ARI:
+
+- Always begin with a warm greeting and ask the user how they're feeling (at the beginning of the conversation).
+- Use the provided {context} (documents) only if the user asks a specific mental health-related question.
+
+As you respond, follow this behavior:
+
+- For the **first 5 user messages**:
+  - Do **not** give advice.
+  - Focus on gentle reflection, open-ended follow-up questions, and emotional validation.
+  - Use short responses (2–4 sentences) and end with an open-ended or supportive question.
+
+- **After 5 user messages**, or if the user explicitly asks for help:
+  - Provide **exactly six short, actionable, and compassionate tips**.
+  - Each tip should be **1–2 sentences**, practical, and emotionally supportive.
+  - Use this structure: [Support type] + [Action] + [Encouraging framing]
+
+  - After sharing the six tips, always end with:  
+    > “Do any of these feel like they might help?”
+
+Keep every reply short — no more than 2–4 sentences.
+
+Always show empathy.
+
+Always end with one clear, open-ended or supportive question — and wait for the user to respond before continuing.
+
+{context}
+
+Chat History: {chat_history}
+
+User Message: {question}
+
+Response:
+"""
+
+
+
+
+    
+    MAIN_PROMPT = PromptTemplate(
+        template=main_prompt_template,
+        input_variables=["chat_history", "context", "question"]
+    )
+
+    # Condense question prompt (for follow-up questions)
+    condense_prompt_template = """Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question.
+    
+    Chat History:
+    {chat_history}
+    
+    Follow Up Question: {question}
+    
+    Standalone Question:"""
+    
+    CONDENSE_PROMPT = PromptTemplate.from_template(condense_prompt_template)
+
+    if "memory" not in st.session_state:
+        st.session_state.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            output_key='answer'
+        )
+
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=st.session_state.memory,
+        combine_docs_chain_kwargs={"prompt": MAIN_PROMPT},
+        condense_question_prompt=CONDENSE_PROMPT,
+        return_source_documents=True,
+        verbose=True,
+        rephrase_question=False  # Don't rephrase the question to maintain original intent
+    )
+
+# === Simple Chat Function (for non-document responses) ===
+def simple_chat(prompt, chat_history):
+    """Handle general conversation without document retrieval."""
+    general_prompt = f"""
+    You are ARI, a compassionate mental health support assistant. The user said:
+    "{prompt}"
+    
+    Respond naturally and supportively in 1-2 short paragraphs. If appropriate, ask a gentle follow-up question to encourage reflection.
+    """
+    
+    llm = initialize_llm()
+    response = llm.invoke(general_prompt)
+    return response.content
+
+# === Determine if a query requires document lookup ===
+def needs_document_lookup(query):
+    """Determine if a query should trigger document retrieval."""
+    # List of general conversation topics that don't need documents
+    general_topics = [
+        "hello", "hi", "hey", "greetings",
+        "how are you", "what's up",
+        "thank you", "thanks", "bye", "goodbye",
+        "who are you", "what can you do",
+        "good morning", "good afternoon", "good evening",
+        "how's it going", "what's new"
+    ]
+    
+    # List of mental health keywords that should trigger document lookup
+    mental_health_keywords = [
+        "depression", "anxiety", "stress", "therapy",
+        "mental health", "counseling", "psychology",
+        "trauma", "ptsd", "bipolar", "ocd", "adhd",
+        "panic attack", "suicidal", "self-harm",
+        "medication", "psychiatrist", "therapist",
+        "coping", "mental illness", "diagnosis",
+        "treatment", "symptoms", "mental disorder"
+    ]
+    
+    query_lower = query.lower()
+    
+    # Check for general topics
+    if any(topic in query_lower for topic in general_topics):
+        return False
+    
+    # Check for mental health keywords
+    if any(keyword in query_lower for keyword in mental_health_keywords):
+        return True
+    
+    # Default to simple chat for short queries
+    if len(query.split()) < 5:
+        return False
+    
+    # For all other cases, use simple chat
+    return False
+
+# === Beautiful Auth Page ===
+def show_auth_page():
+    # Custom CSS for auth page
+    st.markdown("""
+    <style>
+        [data-testid="stAppViewContainer"] {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #ffffff;
+        }
+        .auth-container {
+            max-width: 450px;
+            margin: 2rem auto;
+            padding: 2.5rem;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.36);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .auth-title {
+            text-align: center;
+            margin-bottom: 1.5rem;
+            color: #ffffff;
+            font-family: 'Helvetica Neue', sans-serif;
+            font-weight: 300;
+            font-size: 2rem;
+            background: linear-gradient(90deg, #8B008B 0%, #4169E1 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .auth-subtitle {
+            text-align: center;
+            color: #bbbbbb;
+            margin-bottom: 2rem;
+            font-size: 1rem;
+        }
+        .stTextInput>div>div>input {
+            background: rgba(255, 255, 255, 0.1) !important;
+            color: white !important;
+            border: 1px solid rgba(255, 255, 255, 0.2) !important;
+            border-radius: 12px !important;
+            padding: 10px 15px !important;
+        }
+        .stTextInput>div>div>input:focus {
+            border: 1px solid #8B008B !important;
+            box-shadow: 0 0 0 2px rgba(139, 0, 139, 0.2) !important;
+        }
+        .auth-btn {
+            width: 100%;
+            background: linear-gradient(90deg, #8B008B 0%, #4169E1 100%) !important;
+            color: white !important;
+            border: none !important;
+            border-radius: 12px !important;
+            padding: 12px !important;
+            margin-top: 1.5rem !important;
+            font-weight: 500 !important;
+            transition: all 0.3s ease !important;
+        }
+        .auth-btn:hover {
+            transform: translateY(-2px) !important;
+            box-shadow: 0 4px 12px rgba(139, 0, 139, 0.3) !important;
+        }
+        .toggle-auth {
+            text-align: center;
+            margin-top: 1.5rem;
+            color: #bbbbbb;
+            font-size: 0.9rem;
+        }
+        .toggle-auth a {
+            color: #8B008B !important;
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        .toggle-auth a:hover {
+            color: #4169E1 !important;
+        }
+        .error-message {
+            color: #ff6b6b;
+            text-align: center;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+        }
+        .success-message {
+            color: #51cf66;
+            text-align: center;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+        }
+        .decoration {
+            position: absolute;
+            width: 300px;
+            height: 300px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(139, 0, 139, 0.1) 0%, rgba(0, 0, 0, 0) 70%);
+            z-index: -1;
+        }
+        .decoration-1 {
+            top: -100px;
+            right: -100px;
+        }
+        .decoration-2 {
+            bottom: -100px;
+            left: -100px;
+            background: radial-gradient(circle, rgba(65, 105, 225, 0.1) 0%, rgba(0, 0, 0, 0) 70%);
+        }
+        .stSelectbox>div>div>select {
+            background: rgba(255, 255, 255, 0.1) !important;
+            color: white !important;
+            border: 1px solid rgba(255, 255, 255, 0.2) !important;
+            border-radius: 12px !important;
+            padding: 10px 15px !important;
+        }
+        .stSelectbox>div>div>select:focus {
+            border: 1px solid #8B008B !important;
+            box-shadow: 0 0 0 2px rgba(139, 0, 139, 0.2) !important;
+        }
+        .stNumberInput>div>div>input {
+            background: rgba(255, 255, 255, 0.1) !important;
+            color: white !important;
+            border: 1px solid rgba(255, 255, 255, 0.2) !important;
+            border-radius: 12px !important;
+            padding: 10px 15px !important;
+        }
+        .stNumberInput>div>div>input:focus {
+            border: 1px solid #8B008B !important;
+            box-shadow: 0 0 0 2px rgba(139, 0, 139, 0.2) !important;
+        }
+    </style>
+    <div class="decoration decoration-1"></div>
+    <div class="decoration decoration-2"></div>
+    """, unsafe_allow_html=True)
+    
+    # Center the auth container
+    with st.container():
+        st.markdown("""
+        <div class="auth-container">
+            <h1 class="auth-title">ARI</h1>
+            <p class="auth-subtitle">Your safe space for mental health support</p>
+        """, unsafe_allow_html=True)
+        
+        if "auth_mode" not in st.session_state:
+            st.session_state.auth_mode = "login"
+        
+        if st.session_state.auth_mode == "login":
+            with st.form("login_form"):
+                username = st.text_input("Username", placeholder="Enter your username")
+                password = st.text_input("Password", type="password", placeholder="Enter your password")
+                login_btn = st.form_submit_button("Login", type="primary", use_container_width=True)
+                
+                if login_btn:
+                    if username and password:
+                        success, message = authenticate_user(username, password)
+                        if success:
+                            st.session_state.logged_in = True
+                            st.session_state.username = username
+                            # Create a new session for the user
+                            create_new_session(username)
+                            # Load the current session
+                            user_data = load_user_data()
+                            current_session = user_data[username]["current_session"]
+                            st.session_state.chat_history = user_data[username]["chat_sessions"][current_session]["history"]
+                            st.markdown(f'<div class="success-message">{message}</div>', unsafe_allow_html=True)
+                            st.rerun()
+                        else:
+                            st.markdown(f'<div class="error-message">{message}</div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown('<div class="error-message">Please enter both username and password</div>', unsafe_allow_html=True)
+            
+            st.markdown("""
+            <div class="toggle-auth">
+                Don't have an account? <a href="#" onclick="window.streamlit.setComponentValue('register')">Create one</a>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            if st.button("Switch to Registration", key="register_btn", help="Switch to registration"):
+                st.session_state.auth_mode = "register"
+                st.rerun()
+        
+        else:  # Registration mode
+            with st.form("register_form"):
+                new_username = st.text_input("Username", placeholder="Choose a username")
+                new_password = st.text_input("Password", type="password", placeholder="Choose a password")
+                confirm_password = st.text_input("Confirm Password", type="password", placeholder="Confirm your password")
+                
+                # Add age and gender fields
+                col1, col2 = st.columns(2)
+                with col1:
+                    age = st.number_input("Age", min_value=13, max_value=120, step=1, value=25)
+                with col2:
+                    gender = st.selectbox("Gender", ["Prefer not to say", "Male", "Female"])
+                
+                register_btn = st.form_submit_button("Register", type="primary", use_container_width=True)
+                
+                if register_btn:
+                    if new_username and new_password and confirm_password:
+                        if new_password == confirm_password:
+                            success, message = register_user(new_username, new_password, age, gender)
+                            if success:
+                                st.markdown(f'<div class="success-message">{message}</div>', unsafe_allow_html=True)
+                                st.session_state.auth_mode = "login"
+                                st.rerun()
+                            else:
+                                st.markdown(f'<div class="error-message">{message}</div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown('<div class="error-message">Passwords don\'t match</div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown('<div class="error-message">Please fill all required fields</div>', unsafe_allow_html=True)
+            
+            st.markdown("""
+            <div class="toggle-auth">
+                Already have an account? <a href="#" onclick="window.streamlit.setComponentValue('login')">Sign in</a>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            if st.button("Back to Login", key="login_btn", help="Switch to login"):
+                st.session_state.auth_mode = "login"
+                st.rerun()
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# === Main Chat Interface ===
+def main_chat_interface():
+    # Custom CSS with dark theme
+    st.markdown("""
+    <style>
+        [data-testid="stAppViewContainer"] {
+            background-color: #000000;
+            color: #ffffff;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #111111 !important;
+            border-right: 1px solid #333333;
+        }
+        .therapist-msg {
+            background-color: #000000;
+            color: #ffffff;
+            padding: 15px;
+            border-radius: 18px 18px 18px 0;
+            margin: 10px 0;
+            border: 1px solid #4169E1;
+            max-width: 80%;
+            float: left;
+            clear: both;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            font-size: 1.4rem;  /* Taille de police augmentée */
+            line-height: 1.5;   /* Espacement des lignes amélioré */
+        }
+        .patient-msg {
+            background-color: #000000;
+            color: #ffffff;
+            padding: 15px;
+            border-radius: 18px 18px 0 18px;
+            margin: 10px 0;
+            border: 1px solid #8B008B;
+            max-width: 80%;
+            float: right;
+            clear: both;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            font-size: 1.4rem;  /* Taille de police augmentée */
+            line-height: 1.5;   /* Espacement des lignes amélioré */
+    
+        }
+        .stChatInput {
+            background-color: #222222 !important;
+            color: white !important;
+            border: 1px solid #8B008B;
+            border-radius: 12px;
+        }
+        .upload-section {
+            background-color: rgba(30, 30, 30, 0.8);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(153, 50, 204, 0.1);
+        }
+        h1, h2, h3, h4, h5, h6 {
+            color: #ffffff !important;
+        }
+        p, div, span {
+            color: #ffffff !important;
+        }
+        .stTextInput input {
+            color: white !important;
+            border: 1px solid #8B008B;
+        }
+        .stDownloadButton button {
+            color: white !important;
+            border: 1px solid white !important;
+        }
+        .clear-btn {
+            background-color: #8B008B !important;
+            color: white !important;
+            border: none !important;
+        }
+        .user-info {
+            color: #8B008B !important;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .session-item {
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border-left: 3px solid transparent;
+        }
+        .session-item:hover {
+            background-color: rgba(139, 0, 139, 0.2);
+            border-left: 3px solid #8B008B;
+        }
+        .session-item.active {
+            background-color: rgba(139, 0, 139, 0.3);
+            border-left: 3px solid #8B008B;
+        }
+        .session-date {
+            font-size: 0.8rem;
+            color: #bbbbbb;
+        }
+        .session-preview {
+            font-size: 0.9rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: #dddddd;
+        }
+        .sidebar-section {
+            background-color: rgba(20, 20, 20, 0.8);
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(255,255,255,0.03);
+        }
+        .sidebar-title {
+            color: #8B008B;
+            font-size: 1.1rem;
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #333333;
+        }
+        .delete-btn {
+            background-color: #DC143C !important;
+            color: white !important;
+            border: none !important;
+            margin-top: 5px;
+            width: 100%;
+        }
+        .user-profile {
+            background-color: rgba(65, 105, 225, 0.1);
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 15px;
+            border-left: 3px solid #8B008B;
+        }
+        .profile-label {
+            font-size: 0.8rem;
+            color: #bbbbbb;
+        }
+        .profile-value {
+            font-size: 0.9rem;
+            color: #ffffff;
+            margin-bottom: 10px;
+        }
+        /* Custom spinner */
+        .custom-spinner {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            margin: 10px 0;
+        }
+        .spinner-text {
+            margin-left: 10px;
+            color: #8B008B;
+            font-style: italic;
+        }
+        .spinner-circle {
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(139, 0, 139, 0.3);
+            border-radius: 50%;
+            border-top-color: #8B008B;
+            animation: spin 1s ease-in-out infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Centered title with username
+    st.markdown(f"""
+    <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #ffffff;font-style: italic; text-shadow: 1px 1px 3px #000000; font-family: 'Helvetica Neue', sans-serif; font-weight: 300; letter-spacing: 1px;">Therapeutic Space</h1>
+        <p style="font-size: 1.2em; color: #dddddd; font-style: italic; margin-top: -10px; margin-bottom: 20px;">
+            🧠 Welcome back, {st.session_state.username} 🧠
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Sidebar with session history
+    with st.sidebar:
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        
+        # User profile section with age and gender
+        user_data = load_user_data()
+        user_info = user_data.get(st.session_state.username, {})
+        st.markdown('<div class="user-profile">', unsafe_allow_html=True)
+        st.markdown(f'<div class="user-info">User Profile</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="profile-label">Username</div><div class="profile-value">{st.session_state.username}</div>', unsafe_allow_html=True)
+        
+        if "age" in user_info:
+            st.markdown(f'<div class="profile-label">Age</div><div class="profile-value">{user_info["age"]}</div>', unsafe_allow_html=True)
+        if "gender" in user_info:
+            st.markdown(f'<div class="profile-label">Gender</div><div class="profile-value">{user_info["gender"]}</div>', unsafe_allow_html=True)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # New Session Button
+        if st.button("➕ New Session", key="new_session", use_container_width=True):
+            save_current_session(st.session_state.username)
+            create_new_session(st.session_state.username)
+            st.session_state.chat_history = []
+            st.rerun()
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Session History
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-title">Session History</div>', unsafe_allow_html=True)
+        
+        sessions = user_data.get(st.session_state.username, {}).get("chat_sessions", {})
+        current_session = user_data.get(st.session_state.username, {}).get("current_session", "")
+        
+        if not sessions:
+            st.markdown('<div style="color: #888; font-style: italic;">No previous sessions</div>', unsafe_allow_html=True)
+        else:
+            # Sort sessions by date (newest first)
+            sorted_sessions = sorted(
+                sessions.items(),
+                key=lambda x: x[1]["created_at"],
+                reverse=True
+            )
+            
+            for session_id, session_data in sorted_sessions:
+                # Get first user message as preview
+                preview = "New session"
+                for msg in session_data.get("history", []):
+                    if isinstance(msg, list) and len(msg) == 2 and msg[0] == "You":
+                        preview = msg[1][:50] + "..." if len(msg[1]) > 50 else msg[1]
+                        break
+                    elif isinstance(msg, tuple) and msg[0] == "You":
+                        preview = msg[1][:50] + "..." if len(msg[1]) > 50 else msg[1]
+                        break
+                
+                is_active = session_id == current_session
+                
+                # Create columns for session item and delete button
+                col1, col2 = st.columns([4, 1])
+                
+                with col1:
+                    if st.button(
+                        f"{session_data['created_at']}\n{preview}",
+                        key=f"session_{session_id}",
+                        help="Load this session",
+                        use_container_width=True
+                    ):
+                        if not is_active:
+                            save_current_session(st.session_state.username)
+                            user_data[st.session_state.username]["current_session"] = session_id
+                            st.session_state.chat_history = session_data.get("history", [])
+                            save_user_data(user_data)
+                            st.rerun()
+                
+                with col2:
+                    if st.button(
+                        "🗑️",
+                        key=f"delete_{session_id}",
+                        help="Delete this session",
+                        on_click=delete_session_and_refresh,
+                        args=(st.session_state.username, session_id)
+                    ):
+                        pass
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Logout Button
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        if st.button("Logout", key="logout", use_container_width=True):
+            save_current_session(st.session_state.username)
+            st.session_state.clear()
+            st.session_state.logged_in = False
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Main app logic
+    try:
+        # Initialize components with retry logic
+        llm = initialize_llm()
+        
+        if not os.path.exists(PERSIST_DIR) or not os.listdir(PERSIST_DIR):
+            vector_db = create_vector_db()
+        else:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    embeddings = HuggingFaceEmbeddings(
+                        model_name="sentence-transformers/all-mpnet-base-v2",
+                        model_kwargs={'device': 'cpu'}
+                    )
+                    vector_db = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
+                    break
+                except Exception as e:
+                    if attempt == MAX_RETRIES - 1:
+                        st.error(f"Failed to load vector database after {MAX_RETRIES} attempts: {str(e)}")
+                        st.stop()
+                    time.sleep(RETRY_DELAY)
+        
+        # Initialize chat history if it doesn't exist
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+            greeting = """
+            <div class="therapist-msg">
+                <b>ARI:</b> Welcome to your therapeutic space. My name is ARI and I am here to listen and support you. 
+                This is a safe, confidential environment where you can share anything on your mind. 
+                How are you feeling today?
+            </div>
+            """
+            st.markdown(greeting, unsafe_allow_html=True)
+            st.session_state.chat_history.append(("ARI", "Welcome to your therapeutic space..."))
+        
+        # Initialize QA chain (with memory) if it doesn't exist
+        if "qa_chain" not in st.session_state:
+            st.session_state.qa_chain = setup_conversational_chain(vector_db, llm)
+
+        # Display chat history
+        for msg in st.session_state.chat_history:
+            if isinstance(msg, (tuple, list)) and len(msg) == 2:
+                sender, content = msg
+                if sender == "You":
+                    st.markdown(f'<div class="patient-msg"><b>👤:</b> {content}</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<div class="therapist-msg"><b style="color: #4169E1;">ARI:</b> {content}</div>', unsafe_allow_html=True)
+            else:
+                # Handle case where messages might be in different format
+                st.markdown(f'<div class="therapist-msg"><b style="color: #4169E1;">ARI:</b> {msg}</div>', unsafe_allow_html=True)
+
+        
+       
+        
+        # User input
+        user_input = st.chat_input("Share your thoughts...")
+        
+        if user_input:
+            # Create a custom spinner
+            spinner = st.empty()
+            with spinner.container():
+                st.markdown("""
+                <div class="custom-spinner">
+                    <div class="spinner-circle"></div>
+                    <div class="spinner-text">Thinking carefully about your words...</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            try:
+                # Display user message immediately
+                st.session_state.chat_history.append(("You", user_input))
+                st.markdown(f'<div class="patient-msg"><b>👤:</b> {user_input}</div>', unsafe_allow_html=True)
+                
+                # Get response from QA chain with retry
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        response = st.session_state.qa_chain({"question": user_input})
+                        answer = response.get("answer", "I'm not sure how to respond to that. Could you rephrase?")
+                        break
+                    except Exception as e:
+                        if attempt == MAX_RETRIES - 1:
+                            raise e
+                        time.sleep(RETRY_DELAY)
+                
+                # Debug: Show retrieved documents in expander
+                with st.expander("Retrieved Documents (Debug)"):
+                    for i, doc in enumerate(response["source_documents"]):
+                        st.write(f"Document {i+1}:")
+                        st.code(doc.page_content)
+                        st.write(f"Source: {doc.metadata['source']}")
+                        st.write("---")
+                
+                # Update chat history
+                st.session_state.chat_history.append(("ARI", answer))
+                
+                # Save the current session
+                save_current_session(st.session_state.username)
+                
+                # Clear the spinner
+                spinner.empty()
+                st.rerun()  # Refresh to show new messages
+            except Exception as e:
+                spinner.empty()
+                st.error(f"Sorry, I encountered an error: {str(e)}")
+                st.session_state.chat_history.append(("ARI", "I'm having trouble responding right now. Could you try again?"))
+                st.rerun()
+    
+    except Exception as e:
+        st.error(f"Failed to initialize the chat system: {str(e)}")
+        st.stop()
+
+# === Main App Flow ===
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if st.session_state.logged_in:
+    main_chat_interface()
+else:
+    show_auth_page()
